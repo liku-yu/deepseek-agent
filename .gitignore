@@ -1,0 +1,17 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+.python-version
+
+# PyInstaller build artifacts (keep the spec, ignore the build+dist output)
+/build/
+/dist/
+
+# Secrets — never commit your API key
+.env
+
+# OS
+.DS_Store
+Thumbs.db
