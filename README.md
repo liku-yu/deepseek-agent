@@ -29,6 +29,8 @@ echo "列出当前目录文件" | uv run python agent.py --one
 TUI 用 `prompt_toolkit`(带历史/命令补全/底部状态栏)+ `Rich`(流式思考、正文、箱式的 user 消息与 bash 工具结果)渲染。命令:输入后回车发送;`/help` 查看帮助;`/clear` 清屏;`/exit`/`/quit` 退出(Ctrl+D 亦可)。
 
 > **终端要求**:prompt_toolkit 在 Windows 上需要一个原生控制台。请用 Windows Terminal / cmd / PowerShell 运行,或在 Git Bash(msys)里加 `winpty` 前缀;否则会提示改用 `winpty`。
+>
+> **中文/UTF-8**:agent 启动时统一把 stdin/stdout/stderr 设为 UTF-8,因此 `--one` 的管道输入、`bash` 工具输出与模型返回的中文都能正常显示,不会乱码或报 `UnicodeEncodeError`。
 
 ## 开发运行(uv)
 
@@ -36,6 +38,13 @@ TUI 用 `prompt_toolkit`(带历史/命令补全/底部状态栏)+ `Rich`(流式�
 uv sync                       # 安装依赖(Python 3.12 + httpx + rich + prompt-toolkit)
 uv run python agent.py --one "..."   # 直接从源码运行
 ```
+
+> **网络/镜像**:本机网络常无法直连 `pypi.org`(拉取会报 `tls handshake eof` / `SSL/TLS connection failed`),
+> 请改用国内镜像安装依赖:
+> ```bash
+> UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/ uv sync
+> ```
+> 同步完成后,`uv run` / `./build.sh` 无需联网。
 
 ## 构建 exe
 
