@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Callable, Optional
 
 import httpx
@@ -45,6 +46,25 @@ API_BASE = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp")
 EFFORT = os.environ.get("DEEPSEEK_EFFORT", "high")   # thinking effort: high
 CMD_TIMEOUT = _env_int("DEEPSEEK_CMD_TIMEOUT", 120)  # seconds per shell command
+MAX_RETRIES = _env_int("DEEPSEEK_MAX_RETRIES", 3)    # retries for transient API errors
+
+# HTTP statuses worth retrying
+_TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504}
+# Commands that require explicit approval (P0 safety gate)
+_DANGEROUS_RE = re.compile("|".join([
+    r"\brm\s+-[a-z]*r[a-z]*f", r"\brm\s+-[a-z]*f[a-z]*r",
+    r"\bmkfs\b", r"\bdd\s+if=", r":\(\)\s*\{",
+    r"(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z)?sh\b",
+    r">\s*/etc/", r"\b(shutdown|reboot|halt|poweroff)\b",
+    r"\bformat\s+[a-z]:", r"\bdel\s+/[sfq]\b", r"Remove-Item[^\n]*-Recurse",
+    r"\bchmod\s+-R\s+777\s+/",
+]), re.I)
+# Secrets are stripped from the bash tool's environment (anti-exfiltration)
+_ENV_SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD)", re.I)
+
+
+class AgentError(RuntimeError):
+    """The API reported a failure inside the stream (response.failed/error)."""
 
 SYSTEM = (
     "You are a minimal command-line agent operated inside Git Bash. "
@@ -80,6 +100,7 @@ TOOLS = [
 #   event == "done"             payload: {}
 #   event == "error"            payload: {"message"}
 Emit = Callable[[str, dict], None]
+Confirm = Callable[[str], bool]
 
 
 # ---------------------------------------------------------------- helpers
@@ -176,6 +197,7 @@ def run_command(command: str) -> str:
             errors="replace",
             timeout=CMD_TIMEOUT,
             cwd=os.getcwd(),
+            env=_child_env(),
         )
     except subprocess.TimeoutExpired:
         return "exit_code=124\nstdout:\n(timed out)\nstderr:\n(timed out)"
@@ -192,14 +214,45 @@ def _clean(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def execute_tool(name: str, arguments: str, emit: Optional[Emit] = None) -> str:
+def _child_env() -> dict:
+    """Environment for the bash tool with secrets removed (anti-exfiltration)."""
+    return {k: v for k, v in os.environ.items() if not _ENV_SECRET_RE.search(k)}
+
+
+def is_dangerous(command: str) -> bool:
+    """Heuristic: commands that should require explicit approval."""
+    return bool(command) and bool(_DANGEROUS_RE.search(command))
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for network / 5xx / 429 errors worth retrying."""
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _TRANSIENT_STATUS
+    return False
+
+
+def execute_tool(name: str, arguments: str, emit: Optional[Emit] = None,
+                 confirm: Optional[Confirm] = None) -> str:
     if name != "bash":
         return f"Unknown tool: {name}"
     try:
         args = json.loads(arguments)
-        command = args.get("command", "")
+        command = args.get("command") or ""
     except json.JSONDecodeError:
         return f"Bad arguments JSON: {arguments}"
+    # safety gate: risky commands need explicit approval
+    if is_dangerous(command):
+        allow = (os.environ.get("DEEPSEEK_ALLOW_DANGEROUS", "").strip().lower()
+                 in ("1", "true", "yes", "on"))
+        if not allow:
+            if confirm is None:
+                return ("BLOCKED: this command looks dangerous and no approval channel is "
+                        "available. Ask the user to run it manually, or set "
+                        "DEEPSEEK_ALLOW_DANGEROUS=1 to override.")
+            if not confirm(command):
+                return "BLOCKED: the user denied this command."
     if emit is None:
         # plain REPL: print command + first line of output to stderr
         print(f"  {_CYAN}[bash] $ {command}{_RESET}", file=sys.stderr)
@@ -234,57 +287,89 @@ def stream_call(input_items: list, tools: list, emit: Optional[Emit] = None) -> 
         "temperature": 0.0,
     }
     headers = {"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"}
-    output_items: list[dict] = []
-
-    with httpx.stream("POST", f"{API_BASE}/responses", headers=headers, json=body, timeout=180) as resp:
-        resp.raise_for_status()
-        printed_reasoning = False
-        for line in resp.iter_lines():
-            if not line or not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == "[DONE]":
-                continue
-            evt = json.loads(data)
-            t = evt.get("type")
-
-            if t == "response.reasoning_text.delta":
-                printed_reasoning = True
-                delta = evt.get("delta", "")
-                if emit:
-                    emit("reasoning", {"text": delta})
-                else:
-                    sys.stderr.write(f"{_DIM}{delta}{_RESET}")
-                    sys.stderr.flush()
-            elif t == "response.reasoning_text.done":
-                if printed_reasoning:
-                    if emit:
-                        emit("reasoning_done", {})
-                    else:
-                        sys.stderr.write("\n")
-                        sys.stderr.flush()
+    attempt = 0
+    while True:
+        started = False   # set once the server has produced any event
+        output_items: list[dict] = []
+        try:
+            with httpx.stream("POST", f"{API_BASE}/responses", headers=headers, json=body, timeout=180) as resp:
+                resp.raise_for_status()
                 printed_reasoning = False
-            elif t == "response.output_text.delta":
-                delta = evt.get("delta", "")
+                for line in resp.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    started = True
+                    if data == "[DONE]":
+                        continue
+                    try:
+                        evt = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue   # skip malformed keep-alive / partial frames
+                    t = evt.get("type")
+
+                    # surface API-side failures instead of silently "finishing"
+                    if t in ("response.failed", "error", "response.incomplete"):
+                        err = evt.get("error") or (evt.get("response") or {}).get("error") or t
+                        raise AgentError(f"{t}: {err}")
+                    if t == "response.completed":
+                        usage = (evt.get("response") or {}).get("usage")
+                        if emit and usage:
+                            emit("usage", {"usage": usage})
+                        continue
+
+                    if t == "response.reasoning_text.delta":
+                        printed_reasoning = True
+                        delta = evt.get("delta", "")
+                        if emit:
+                            emit("reasoning", {"text": delta})
+                        else:
+                            sys.stderr.write(f"{_DIM}{delta}{_RESET}")
+                            sys.stderr.flush()
+                    elif t == "response.reasoning_text.done":
+                        if printed_reasoning:
+                            if emit:
+                                emit("reasoning_done", {})
+                            else:
+                                sys.stderr.write("\n")
+                                sys.stderr.flush()
+                        printed_reasoning = False
+                    elif t == "response.output_text.delta":
+                        delta = evt.get("delta", "")
+                        if emit:
+                            emit("text", {"text": delta})
+                        else:
+                            sys.stdout.write(delta)
+                            sys.stdout.flush()
+                    elif t == "response.output_text.done":
+                        if emit:
+                            emit("text_done", {})
+                        else:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                    elif t == "response.output_item.done":
+                        item = evt.get("item") or {}
+                        output_items.append(item)
+            return output_items
+        except Exception as e:
+            # Retry transient failures only if nothing has streamed yet
+            # (avoid duplicating already-rendered output).
+            if _is_transient(e) and not started and attempt < MAX_RETRIES:
+                attempt += 1
+                delay = min(2 ** attempt, 8)
                 if emit:
-                    emit("text", {"text": delta})
-                else:
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
-            elif t == "response.output_text.done":
-                if emit:
-                    emit("text_done", {})
-                else:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-            elif t == "response.output_item.done":
-                item = evt.get("item") or {}
-                output_items.append(item)
-    return output_items
+                    emit("notice", {"message": f"transient error ({e}); "
+                                                  f"retry {attempt}/{MAX_RETRIES} in {delay}s…"})
+                time.sleep(delay)
+                continue
+            raise
 
 
 # ---------------------------------------------------------------- core loop
-def run_agent(input_items: list, emit: Optional[Emit] = None) -> None:
+def run_agent(input_items: list, emit: Optional[Emit] = None,
+              confirm: Optional[Confirm] = None) -> None:
     """Keep calling the model, running tools, feeding results back.
 
     No cap on tool rounds: keep going until the model produces a final message.
@@ -293,10 +378,12 @@ def run_agent(input_items: list, emit: Optional[Emit] = None) -> None:
         try:
             output_items = stream_call(input_items, TOOLS, emit)
         except Exception as e:
+            # Abort this turn on error. (Previously it fell through and used a
+            # stale/undefined `output_items`, causing UnboundLocalError or loops.)
             if emit:
                 emit("error", {"message": str(e)})
-            else:
-                raise
+                return
+            raise
         # feed completed items back so the model sees its own reasoning & calls
         input_items.extend(output_items)
 
@@ -307,7 +394,7 @@ def run_agent(input_items: list, emit: Optional[Emit] = None) -> None:
             return
 
         for call in tool_calls:
-            result = execute_tool(call.get("name", ""), call.get("arguments", "{}"), emit)
+            result = execute_tool(call.get("name", ""), call.get("arguments", "{}"), emit, confirm)
             input_items.append(
                 {
                     "type": "function_call_output",
@@ -335,6 +422,17 @@ def single_shot(text: str) -> None:
         run_agent(input_items)
     except KeyboardInterrupt:
         print("\n[aborted]", file=sys.stderr)
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+
+
+def _plain_confirm(command: str) -> bool:
+    """Ask the user to approve a risky command in the plain REPL."""
+    try:
+        ans = input(f"\n[approve] risky command:\n  {command}\nRun it? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans in ("y", "yes")
 
 
 def repl() -> None:
@@ -353,9 +451,11 @@ def repl() -> None:
             break
         input_items.append(_user_item(raw))
         try:
-            run_agent(input_items)
+            run_agent(input_items, confirm=_plain_confirm)
         except KeyboardInterrupt:
             print("\n[aborted]", file=sys.stderr)
+        except Exception as e:
+            print(f"[error] {e}", file=sys.stderr)
 
 
 def main() -> None:

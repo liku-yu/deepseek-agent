@@ -31,6 +31,7 @@ ACCENT = "#8abeb7"      # accent / prompt
 BORDER = "#5f87ff"      # borders
 SUCCESS = "#b5bd68"     # tool success
 ERROR = "#cc6666"       # tool error / errors
+WARNING = "#ffff00"     # approval prompts
 DIM = "#666666"         # reasoning / muted
 TEXT = "#d4d4d4"        # default text
 USER_BG = "#343541"     # user message background
@@ -102,9 +103,24 @@ def make_emit():
             _render_tool(payload)
         elif event == "done":
             console.print()
+        elif event == "notice":
+            console.print(Text(payload.get("message", ""), style=DIM))
         elif event == "error":
             console.print(Text(f"[error] {payload.get('message', 'unknown')}", style=ERROR))
     return emit
+
+
+def _make_confirm(session):
+    """Build a confirmation callback that asks the user before risky commands."""
+    def confirm(command: str) -> bool:
+        console.print(Text("\n[approve] the agent wants to run a risky command:", style=WARNING))
+        console.print(Text(f"  {command}", style=TEXT))
+        try:
+            ans = session.prompt(ANSI("\x1b[93m  approve? [y/N] \x1b[0m"))
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return (ans or "").strip().lower() in ("y", "yes")
+    return confirm
 
 
 # ---------------------------------------------------------------- main loop
@@ -148,6 +164,7 @@ def run_tui() -> None:
 
     input_items = [agent_mod._system_item()]
     emit = make_emit()
+    confirm = _make_confirm(session)
 
     _banner()
     while True:
@@ -182,7 +199,7 @@ def run_tui() -> None:
         _render_user(text)
         input_items.append(agent_mod._user_item(text))
         try:
-            agent_mod.run_agent(input_items, emit=emit)
+            agent_mod.run_agent(input_items, emit=emit, confirm=confirm)
         except KeyboardInterrupt:
             console.print(Text("\n[aborted]", style=DIM))
 
