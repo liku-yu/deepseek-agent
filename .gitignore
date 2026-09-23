@@ -15,7 +15,3 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
-
-# Local convenience scripts (not required to reproduce)
-/build.sh
-/ship.sh

@@ -45,12 +45,16 @@ TUI 内:`/help` 帮助、`/clear` 清屏、`/exit` 退出;运行中 **Ctrl+C 可
 
 循环请求 `/v1/responses`(流式渲染 `reasoning`/`text`);出现 `function_call` 就用 `bash` 执行并回填 `function_call_output`,直到模型给出最终回答(**不限轮数**)。
 
-## 构建 exe
+## 构建 / 发布
 
 ```bash
-uv run pyinstaller --noconfirm --clean --distpath C:/develop/bin deepseek-agent.spec
-# 产物:C:/develop/bin/deepseek-agent.exe
+./build.sh              # 构建 exe -> C:/develop/bin/deepseek-agent.exe(OUT= 可改目录)
+./ship.sh "commit msg"  # 构建 + 提交并推送到 GitHub / cnb.cool
 ```
+
+- `build.sh`:先 `uv sync` 装依赖,再 `pyinstaller` 打成单文件 exe;`OUT=dist ./build.sh` 可改输出目录。
+- `ship.sh`:先提交并推送代码,再重建 exe;推送失败会自动重试(GitHub 链路偶发不稳)。
+- 等价的直接命令:`uv run pyinstaller --noconfirm --clean --distpath C:/develop/bin deepseek-agent.spec`。
 
 ## 开发
 
@@ -61,4 +65,4 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/ uv sync
 
 ## 文件
 
-`agent.py` 核心逻辑 · `tui.py` 界面 · `deepseek-agent.spec` 打包配置 · `pyproject.toml`/`uv.lock` 依赖 · `.env.example` key 模板
+`agent.py` 核心逻辑 · `tui.py` 界面 · `build.sh`/`ship.sh` 构建发布 · `deepseek-agent.spec` 打包配置 · `pyproject.toml`/`uv.lock` 依赖 · `.env.example` key 模板
