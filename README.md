@@ -1,92 +1,64 @@
-# DeepSeek Agent (极简,单文件 exe)
+# DeepSeek Agent
 
-一个使用 DeepSeek **Responses API**(`POST /v1/responses`)的极简 agent。
-模型 `deepseek-v4-flash-vision-exp`,推理强度 `high`,**流式输出**。
-自带 `bash` 工具,可在 Git Bash 中执行真实命令。用 `uv` 管理,并打包为单个 `.exe`。
+极简命令行 agent:DeepSeek **Responses API**(`POST /v1/responses`)流式,自带 `bash` 工具在 Git Bash 中执行真实命令。`uv` 管理,可打包成单个 exe。
 
-> 运行环境需已安装 [Git for Windows](https://git-scm.com) 以便 `bash` 工具执行命令。
+- 模型 `deepseek-v4-flash-vision-exp`(实验性)、推理 `high`
+- 交互界面:prompt_toolkit + Rich 的 TUI(可用 `--plain` 退化为纯文本)
+
+## 依赖
+
+- Python 3.11–3.13(uv 自动管理)
+- [Git for Windows](https://git-scm.com)(`bash` 工具需要)
+- `DEEPSEEK_API_KEY`:环境变量,或 exe/脚本旁的 `.env`(见 `.env.example`)
 
 ## 使用
 
-先准备 API key:复制 `.env.example` 为 `.env` 并填入 key,或用环境变量:
 ```bash
-export DEEPSEEK_API_KEY=sk-xxxx
+uv sync                          # 安装依赖(网络不通见下方镜像)
+uv run python agent.py           # TUI(默认)
+winpty uv run python agent.py    # Git Bash 下需 winpty
+uv run python agent.py --plain   # 纯文本 REPL
+uv run python agent.py --one "用 bash 看看当前目录"   # 单次
+echo "..." | uv run python agent.py --one            # 管道输入
 ```
 
-```bash
-# 交互式对话——prompt_toolkit + Rich 的 TUI(默认)
-uv run python agent.py
-# 或在 Git Bash 里(winpty 提供 Windows 控制台)
-winpty uv run python agent.py
-# 或旧版纯文本 REPL
-uv run python agent.py --plain
+TUI 内:`/help` 帮助、`/clear` 清屏、`/exit` 退出;运行中 **Ctrl+C 可中止**(会杀掉整棵子进程树)。
 
-# 单次问答(流式输出到 stdout)
-uv run python agent.py --one "用 bash 看看当前目录有哪些文件"
-echo "列出当前目录文件" | uv run python agent.py --one
-```
+> **TUI 终端要求**:需原生 Windows 控制台 → 用 Windows Terminal / cmd / PowerShell,或 Git Bash 加 `winpty`。
+> **中文/UTF-8**:已统一 UTF-8 I/O,中文输入输出不会乱码。
 
-TUI 用 `prompt_toolkit`(带历史/命令补全/底部状态栏)+ `Rich`(流式思考、正文、箱式的 user 消息与 bash 工具结果)渲染。命令:输入后回车发送;`/help` 查看帮助;`/clear` 清屏;`/exit`/`/quit` 退出(Ctrl+D 亦可)。
+## 配置(均可用环境变量覆盖)
 
-> **终端要求**:prompt_toolkit 在 Windows 上需要一个原生控制台。请用 Windows Terminal / cmd / PowerShell 运行,或在 Git Bash(msys)里加 `winpty` 前缀;否则会提示改用 `winpty`。
->
-> **中文/UTF-8**:agent 启动时统一把 stdin/stdout/stderr 设为 UTF-8,因此 `--one` 的管道输入、`bash` 工具输出与模型返回的中文都能正常显示,不会乱码或报 `UnicodeEncodeError`。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash-vision-exp` | 模型(账号未开通时改这里) |
+| `DEEPSEEK_EFFORT` | `high` | 推理强度 |
+| `DEEPSEEK_CMD_TIMEOUT` | `120` | 单条命令超时(秒) |
+| `DEEPSEEK_MAX_RETRIES` | `3` | 瞬时错误重试次数 |
+| `DEEPSEEK_MAX_CONTEXT_CHARS` | `200000` | 超限时裁掉最旧整轮对话 |
+| `DEEPSEEK_ALLOW_DANGEROUS` | 空 | 设 `1` 跳过危险命令审批 |
+| `DEEPSEEK_API_BASE` | `https://api.deepseek.com/v1` | 接口地址 |
 
-## 开发运行(uv)
-
-```bash
-uv sync                       # 安装依赖(Python 3.12 + httpx + rich + prompt-toolkit)
-uv run python agent.py --one "..."   # 直接从源码运行
-```
-
-> **网络/镜像**:本机网络常无法直连 `pypi.org`(拉取会报 `tls handshake eof` / `SSL/TLS connection failed`),
-> 请改用国内镜像安装依赖:
-> ```bash
-> UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/ uv sync
-> ```
-> 同步完成后,`uv run` / `./build.sh` 无需联网。
-
-## 构建 exe
-
-```bash
-./build.sh                    # 需要先用 uv 装好依赖(含 pyinstaller)
-# 默认输出到 C:/develop/bin,也可: OUT=dist ./build.sh
-```
-产物:`C:/develop/bin/deepseek-agent.exe`(约 14MB,含 Python + httpx + rich + prompt_toolkit,已把 TUI 打进去)。
-运行 exe 时在 exe 旁边放 `.env` 或设置环境变量即可换 key。exe 在 Git Bash 里同样用 `winpty deepseek-agent.exe` 启动 TUI。
-
-> 一键发布:`./ship.sh "commit message"` —— 自动提交 → 推送 GitHub + cnb.cool → 重建 exe。
+> **安全**:危险命令(`rm -rf` 等)、敏感文件(`.env`/`.ssh` 等)、网络命令(`curl` 等)默认需审批,非交互(`--one`)直接拦截。**这是启发式防护、不是沙箱**,请自行评估风险。
 
 ## 原理
 
-1. 组装 `input`(系统提示 + 历史),请求 `/v1/responses`,推理 `high`。
-2. 响应为 SSE,按 `response.reasoning_text.delta` / `response.output_text.delta`
-   实时流式渲染;用 `response.output_item.done` 收集完整条目。
-3. 若出现 `function_call`,用 `bash` 执行并把 `function_call_output` 回填,
-   继续下一轮(不限轮数,直到模型给出最终回答)。
-4. 每轮把 `reasoning` / `message` / `function_call` 追加回上下文。
+循环请求 `/v1/responses`(流式渲染 `reasoning`/`text`);出现 `function_call` 就用 `bash` 执行并回填 `function_call_output`,直到模型给出最终回答(**不限轮数**)。
 
-## 配置(agent.py 顶部,均可用环境变量覆盖)
+## 构建 / 发布
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `MODEL` / `DEEPSEEK_MODEL` | `deepseek-v4-flash-vision-exp` | 模型 |
-| `EFFORT` / `DEEPSEEK_EFFORT` | `high` | 推理强度 |
-| `CMD_TIMEOUT` / `DEEPSEEK_CMD_TIMEOUT` | `120` | 单条命令超时(秒) |
+```bash
+./build.sh              # -> C:/develop/bin/deepseek-agent.exe(可用 OUT= 改目录)
+./ship.sh "commit msg"  # 提交 + 推 GitHub/cnb + 重建 exe
+```
 
-> 注意:`deepseek-v4-flash-vision-exp` 是实验性模型,若你的账号未开通,
-> 请通过 `DEEPSEEK_MODEL` 改成你有权限的模型。
+## 开发
+
+```bash
+# pypi.org 不通时用国内镜像
+UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/ uv sync
+```
 
 ## 文件
 
-```
-agent.py             # agent 逻辑(uv/Python,流式;含事件回调供 TUI 复用)
-tui.py               # prompt_toolkit + Rich 的 TUI
-build.sh             # 构建 exe
-deepseek-agent.spec  # PyInstaller 规范(onefile + optimize,含 rich/prompt_toolkit)
-pyproject.toml       # uv 项目定义(httpx + rich + prompt-toolkit)
-.env.example         # API key 模板(真正的 key 在 .env,不入库)
-.venv/               # uv 虚拟环境
-```
-
-> TUI 依赖 `rich`/`prompt_toolkit`(随 `uv sync` 一并安装);`--one`/`--plain` 不依赖它们。
+`agent.py` 核心逻辑 · `tui.py` 界面 · `build.sh`/`ship.sh` 构建发布 · `deepseek-agent.spec` 打包 · `pyproject.toml` 依赖 · `.env.example` key 模板
