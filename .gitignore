@@ -15,3 +15,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local-only release helper (build.sh is the tracked build script)
+/ship.sh
