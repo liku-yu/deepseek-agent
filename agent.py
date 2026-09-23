@@ -16,12 +16,15 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Optional
 
@@ -47,24 +50,114 @@ MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp")
 EFFORT = os.environ.get("DEEPSEEK_EFFORT", "high")   # thinking effort: high
 CMD_TIMEOUT = _env_int("DEEPSEEK_CMD_TIMEOUT", 120)  # seconds per shell command
 MAX_RETRIES = _env_int("DEEPSEEK_MAX_RETRIES", 3)    # retries for transient API errors
+MAX_CONTEXT_CHARS = _env_int("DEEPSEEK_MAX_CONTEXT_CHARS", 200_000)  # rough budget before trimming
 
 # HTTP statuses worth retrying
 _TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504}
-# Commands that require explicit approval (P0 safety gate)
-_DANGEROUS_RE = re.compile("|".join([
-    r"\brm\s+-[a-z]*r[a-z]*f", r"\brm\s+-[a-z]*f[a-z]*r",
+# --- safety policy (heuristic, defence-in-depth; NOT a sandbox) ---
+_NET_CMDS = {"curl", "wget", "nc", "ncat", "netcat", "ssh", "scp", "sftp",
+             "rsync", "telnet", "ftp"}
+_DESTRUCTIVE_RE = re.compile("|".join([
     r"\bmkfs\b", r"\bdd\s+if=", r":\(\)\s*\{",
-    r"(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z)?sh\b",
-    r">\s*/etc/", r"\b(shutdown|reboot|halt|poweroff)\b",
-    r"\bformat\s+[a-z]:", r"\bdel\s+/[sfq]\b", r"Remove-Item[^\n]*-Recurse",
-    r"\bchmod\s+-R\s+777\s+/",
+    r"\b(shutdown|reboot|halt|poweroff)\b", r"\bformat\s+[a-z]:",
+    r"\bdel\s+/[sfq]\b", r"remove-item[^\n]*-recurse",
+    r"\bchmod\s+-r\s+777\s+/", r"\bshred\b", r"\btruncate\s+-s\s*0",
+    r"\bfind\b[^\n]*\s-delete\b", r"\bgit\s+clean\b[^\n]*-[a-z]*[dfx]",
+    r">\s*/etc/", r">\s*/dev/sd",
 ]), re.I)
+_SENSITIVE_RE = re.compile(
+    r"(^|[\s=<>@/\\\"'`])(\.env(\.[\w.-]+)?|\.ssh/|id_rsa|id_ed25519|"
+    r"\.aws/credentials|\.git-credentials|\.netrc|\.npmrc|\.pypirc|"
+    r"credentials(\.json)?)(?=$|[\s\"'`);|&><])", re.I)
 # Secrets are stripped from the bash tool's environment (anti-exfiltration)
 _ENV_SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD)", re.I)
 
 
+def _normalize(command: str) -> str:
+    """Lowercase + drop quotes/backslashes + collapse whitespace for matching."""
+    s = re.sub(r"[\"'`\\]", "", command)
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def _rm_recursive_force(s: str) -> bool:
+    for seg in re.split(r"[;&|]+", s):
+        toks = seg.split()
+        if not toks or "rm" not in toks[0]:
+            continue
+        flags = " ".join(t for t in toks[1:] if t.startswith("-"))
+        if re.search(r"(^|\s)-[a-z]*r|--recursive", flags) and \
+           re.search(r"(^|\s)-[a-z]*f|--force", flags):
+            return True
+    return False
+
+
+def _has_network_egress(s: str) -> bool:
+    for seg in re.split(r"[;&|]+", s):
+        toks = seg.split()
+        if toks and toks[0] in _NET_CMDS:
+            return True
+    return False
+
+
+def classify_command(command: str) -> list[str]:
+    """Risk categories for a shell command (empty list = allow without asking)."""
+    if not command:
+        return []
+    s = _normalize(command)
+    reasons = []
+    if _rm_recursive_force(s) or _DESTRUCTIVE_RE.search(s):
+        reasons.append("destructive")
+    if _SENSITIVE_RE.search(command):
+        reasons.append("sensitive-file")
+    if _has_network_egress(s):
+        reasons.append("network-egress")
+    return reasons
+
+
+def is_dangerous(command: str) -> bool:
+    return bool(classify_command(command))
+
+
+# --- cancellation ---
+_cancel = threading.Event()
+
+
 class AgentError(RuntimeError):
     """The API reported a failure inside the stream (response.failed/error)."""
+
+
+class CancelledError(RuntimeError):
+    """The user cancelled the current turn."""
+
+
+def request_cancel() -> None:
+    _cancel.set()
+
+
+def clear_cancel() -> None:
+    _cancel.clear()
+
+
+@contextlib.contextmanager
+def cancellable():
+    """While active, Ctrl+C requests cancellation instead of raising."""
+    clear_cancel()
+    old = None
+    if threading.current_thread() is threading.main_thread():
+        try:
+            old = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, lambda *_: request_cancel())
+        except Exception:
+            old = None
+    try:
+        yield
+    finally:
+        if old is not None:
+            try:
+                signal.signal(signal.SIGINT, old)
+            except Exception:
+                pass
+        clear_cancel()
 
 SYSTEM = (
     "You are a minimal command-line agent operated inside Git Bash. "
@@ -185,25 +278,74 @@ def find_bash() -> str:
     return "bash"
 
 
-def run_command(command: str) -> str:
-    """Run a command in Git Bash. Return a compact text report."""
-    bash = find_bash()
+def _kill_tree(proc: "subprocess.Popen") -> None:
+    """Kill a process and all of its descendants."""
     try:
-        proc = subprocess.run(
-            [bash, "-lc", command],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=CMD_TIMEOUT,
-            cwd=os.getcwd(),
-            env=_child_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return "exit_code=124\nstdout:\n(timed out)\nstderr:\n(timed out)"
-    out, err, code = proc.stdout, proc.stderr, proc.returncode
-    out = _clean(out)[:4000] or "(no stdout)"
-    err = _clean(err)[:2000] or "(no stderr)"
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_command(command: str) -> str:
+    """Run a command in Git Bash. Return a compact text report.
+
+    bash runs in its own process group, so a timeout or cancel kills the whole
+    process tree (not just bash). Polls for cancellation every 0.2s.
+    """
+    bash = find_bash()
+    popen_kwargs: dict = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=os.getcwd(),
+        env=_child_env(),
+    )
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen([bash, "-lc", command], **popen_kwargs)
+    deadline = time.monotonic() + CMD_TIMEOUT
+    try:
+        while True:
+            try:
+                out, err = proc.communicate(timeout=0.2)
+                code = proc.returncode
+                break
+            except subprocess.TimeoutExpired:
+                if _cancel.is_set():
+                    _kill_tree(proc)
+                    try:
+                        proc.communicate(timeout=5)
+                    except Exception:
+                        pass
+                    return "exit_code=130\nstdout:\n(cancelled)\nstderr:\n(cancelled)"
+                if time.monotonic() >= deadline:
+                    _kill_tree(proc)
+                    try:
+                        proc.communicate(timeout=5)
+                    except Exception:
+                        pass
+                    return "exit_code=124\nstdout:\n(timed out)\nstderr:\n(timed out)"
+    except KeyboardInterrupt:
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+    out = _clean(out or "")[:4000] or "(no stdout)"
+    err = _clean(err or "")[:2000] or "(no stderr)"
     return f"exit_code={code}\nstdout:\n{out}\nstderr:\n{err}"
 
 
@@ -242,17 +384,19 @@ def execute_tool(name: str, arguments: str, emit: Optional[Emit] = None,
         command = args.get("command") or ""
     except json.JSONDecodeError:
         return f"Bad arguments JSON: {arguments}"
-    # safety gate: risky commands need explicit approval
-    if is_dangerous(command):
+    # safety policy: risky commands need explicit approval
+    reasons = classify_command(command)
+    if reasons:
         allow = (os.environ.get("DEEPSEEK_ALLOW_DANGEROUS", "").strip().lower()
                  in ("1", "true", "yes", "on"))
         if not allow:
+            tag = ", ".join(reasons)
             if confirm is None:
-                return ("BLOCKED: this command looks dangerous and no approval channel is "
-                        "available. Ask the user to run it manually, or set "
+                return (f"BLOCKED ({tag}): this command looks risky and no approval channel "
+                        "is available. Ask the user to run it manually, or set "
                         "DEEPSEEK_ALLOW_DANGEROUS=1 to override.")
             if not confirm(command):
-                return "BLOCKED: the user denied this command."
+                return f"BLOCKED ({tag}): the user denied this command."
     if emit is None:
         # plain REPL: print command + first line of output to stderr
         print(f"  {_CYAN}[bash] $ {command}{_RESET}", file=sys.stderr)
@@ -289,6 +433,8 @@ def stream_call(input_items: list, tools: list, emit: Optional[Emit] = None) -> 
     headers = {"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"}
     attempt = 0
     while True:
+        if _cancel.is_set():
+            raise CancelledError("cancelled by user")
         started = False   # set once the server has produced any event
         output_items: list[dict] = []
         try:
@@ -296,6 +442,8 @@ def stream_call(input_items: list, tools: list, emit: Optional[Emit] = None) -> 
                 resp.raise_for_status()
                 printed_reasoning = False
                 for line in resp.iter_lines():
+                    if _cancel.is_set():
+                        raise CancelledError("cancelled by user")
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -367,6 +515,40 @@ def stream_call(input_items: list, tools: list, emit: Optional[Emit] = None) -> 
             raise
 
 
+# ---------------------------------------------------------------- context budget
+def _items_size(items: list) -> int:
+    return sum(len(json.dumps(it, ensure_ascii=False, default=str)) for it in items)
+
+
+def _compact(input_items: list) -> None:
+    """Trim the oldest whole turns so the request stays under a rough char budget."""
+    if len(input_items) <= 2 or _items_size(input_items) <= MAX_CONTEXT_CHARS:
+        return
+    system = input_items[0]
+    groups: list[list] = []
+    cur: list = []
+    for it in input_items[1:]:
+        if it.get("type") == "message" and it.get("role") == "user":
+            if cur:
+                groups.append(cur)
+            cur = [it]
+        else:
+            cur.append(it)
+    if cur:
+        groups.append(cur)
+    while len(groups) > 1 and \
+            _items_size([system] + [x for g in groups for x in g]) > MAX_CONTEXT_CHARS:
+        groups.pop(0)
+    input_items[:] = [system] + [x for g in groups for x in g]
+
+
+def _abort(emit: Optional[Emit]) -> None:
+    if emit:
+        emit("aborted", {})
+    else:
+        print("\n[aborted]", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- core loop
 def run_agent(input_items: list, emit: Optional[Emit] = None,
               confirm: Optional[Confirm] = None) -> None:
@@ -375,8 +557,15 @@ def run_agent(input_items: list, emit: Optional[Emit] = None,
     No cap on tool rounds: keep going until the model produces a final message.
     """
     while True:
+        if _cancel.is_set():
+            _abort(emit)
+            return
+        _compact(input_items)
         try:
             output_items = stream_call(input_items, TOOLS, emit)
+        except CancelledError:
+            _abort(emit)
+            return
         except Exception as e:
             # Abort this turn on error. (Previously it fell through and used a
             # stale/undefined `output_items`, causing UnboundLocalError or loops.)
@@ -419,7 +608,8 @@ def single_shot(text: str) -> None:
     if text:
         input_items.append(_user_item(text))
     try:
-        run_agent(input_items)
+        with cancellable():
+            run_agent(input_items)
     except KeyboardInterrupt:
         print("\n[aborted]", file=sys.stderr)
     except Exception as e:
@@ -451,7 +641,8 @@ def repl() -> None:
             break
         input_items.append(_user_item(raw))
         try:
-            run_agent(input_items, confirm=_plain_confirm)
+            with cancellable():
+                run_agent(input_items, confirm=_plain_confirm)
         except KeyboardInterrupt:
             print("\n[aborted]", file=sys.stderr)
         except Exception as e:

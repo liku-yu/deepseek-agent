@@ -105,6 +105,8 @@ def make_emit():
             console.print()
         elif event == "notice":
             console.print(Text(payload.get("message", ""), style=DIM))
+        elif event == "aborted":
+            console.print(Text("[aborted]", style=DIM))
         elif event == "error":
             console.print(Text(f"[error] {payload.get('message', 'unknown')}", style=ERROR))
     return emit
@@ -199,7 +201,8 @@ def run_tui() -> None:
         _render_user(text)
         input_items.append(agent_mod._user_item(text))
         try:
-            agent_mod.run_agent(input_items, emit=emit, confirm=confirm)
+            with agent_mod.cancellable():
+                agent_mod.run_agent(input_items, emit=emit, confirm=confirm)
         except KeyboardInterrupt:
             console.print(Text("\n[aborted]", style=DIM))
 

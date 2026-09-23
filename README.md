@@ -55,6 +55,8 @@ uv run python agent.py --one "..."   # 直接从源码运行
 产物:`C:/develop/bin/deepseek-agent.exe`(约 14MB,含 Python + httpx + rich + prompt_toolkit,已把 TUI 打进去)。
 运行 exe 时在 exe 旁边放 `.env` 或设置环境变量即可换 key。exe 在 Git Bash 里同样用 `winpty deepseek-agent.exe` 启动 TUI。
 
+> 一键发布:`./ship.sh "commit message"` —— 自动提交 → 推送 GitHub + cnb.cool → 重建 exe。
+
 ## 原理
 
 1. 组装 `input`(系统提示 + 历史),请求 `/v1/responses`,推理 `high`。
