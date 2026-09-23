@@ -45,11 +45,11 @@ TUI 内:`/help` 帮助、`/clear` 清屏、`/exit` 退出;运行中 **Ctrl+C 可
 
 循环请求 `/v1/responses`(流式渲染 `reasoning`/`text`);出现 `function_call` 就用 `bash` 执行并回填 `function_call_output`,直到模型给出最终回答(**不限轮数**)。
 
-## 构建 / 发布
+## 构建 exe
 
 ```bash
-./build.sh              # -> C:/develop/bin/deepseek-agent.exe(可用 OUT= 改目录)
-./ship.sh "commit msg"  # 提交 + 推 GitHub/cnb + 重建 exe
+uv run pyinstaller --noconfirm --clean --distpath C:/develop/bin deepseek-agent.spec
+# 产物:C:/develop/bin/deepseek-agent.exe
 ```
 
 ## 开发
@@ -61,4 +61,4 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/ uv sync
 
 ## 文件
 
-`agent.py` 核心逻辑 · `tui.py` 界面 · `build.sh`/`ship.sh` 构建发布 · `deepseek-agent.spec` 打包 · `pyproject.toml` 依赖 · `.env.example` key 模板
+`agent.py` 核心逻辑 · `tui.py` 界面 · `deepseek-agent.spec` 打包配置 · `pyproject.toml`/`uv.lock` 依赖 · `.env.example` key 模板
