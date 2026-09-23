@@ -361,11 +361,6 @@ def _child_env() -> dict:
     return {k: v for k, v in os.environ.items() if not _ENV_SECRET_RE.search(k)}
 
 
-def is_dangerous(command: str) -> bool:
-    """Heuristic: commands that should require explicit approval."""
-    return bool(command) and bool(_DANGEROUS_RE.search(command))
-
-
 def _is_transient(exc: Exception) -> bool:
     """True for network / 5xx / 429 errors worth retrying."""
     if isinstance(exc, httpx.TransportError):
